@@ -53,7 +53,7 @@ class C3(nn.Module):
         self.cv1 = Conv(in_channels, hidden_channels, 1, 1)
         self.cv2 = Conv(in_channels, hidden_channels, 1, 1)
         self.cv3 = Conv(2 * hidden_channels, out_channels, 1)
-        self.m = nn.Sequential(*(Bottleneck(hidden_channels, hidden_channels, shortcut, groups, e=1.0) 
+        self.m = nn.Sequential(*(Bottleneck(hidden_channels, hidden_channels, shortcut, groups, expansion=1.0)
                                  for _ in range(num_blocks)))
     
     def forward(self, x):
@@ -205,10 +205,10 @@ class YOLOv5(nn.Module):
         
         # Bottom-up pathway
         self.conv8 = Conv(128, 128, 3, 2)          # 128x40x40
-        self.c3_7 = C3(256, 256, 1, False)         # 256x40x40
-        
+        self.c3_7 = C3(384, 256, 1, False)         # Takes 128+256=384, outputs 256x40x40
+
         self.conv9 = Conv(256, 256, 3, 2)          # 256x20x20
-        self.c3_8 = C3(512, 512, 1, False)         # 512x20x20
+        self.c3_8 = C3(768, 512, 1, False)         # Takes 256+512=768, outputs 512x20x20
         
         # ==================== HEAD ====================
         self.detect = Detect(num_classes, self.anchors, (128, 256, 512))
@@ -246,17 +246,16 @@ class YOLOv5(nn.Module):
         x = self.conv6(p5)
         x = self.upsample1(x)
         x = torch.cat([x, p4], 1)
-        x = self.c3_5(x)  # 256x40x40
-        
-        x = self.conv7(x)
+        p4_fused = self.c3_5(x)  # 256x40x40 - Save for bottom-up
+
+        x = self.conv7(p4_fused)
         x = self.upsample2(x)
         x = torch.cat([x, p3], 1)
         out1 = self.c3_6(x)  # 128x80x80 - Small objects (P3)
-        
+
         # Neck - Bottom-up
-        x = self.conv8(out1)
-        x = torch.cat([x, self.conv7.conv(self.c3_5(torch.cat([self.upsample1(self.conv6(p5)), p4], 1)))], 1)
-        x = torch.cat([self.conv8(out1), self.c3_5(torch.cat([self.upsample1(self.conv6(p5)), p4], 1))], 1)
+        x = self.conv8(out1)  # 128 channels
+        x = torch.cat([x, p4_fused], 1)  # 128 + 256 = 384 channels
         out2 = self.c3_7(x)  # 256x40x40 - Medium objects (P4)
         
         x = self.conv9(out2)
@@ -365,7 +364,7 @@ class YOLOLoss:
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)
-                iou = bbox_iou(pbox.T, tbox[i])
+                iou = bbox_iou(pbox, tbox[i])
                 lbox += (1.0 - iou).mean()
                 
                 # Objectness loss
@@ -390,10 +389,10 @@ class YOLOLoss:
         """Build targets for loss computation."""
         na, nt = self.na, targets.shape[0]
         tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=self.device)
-        
+        gain = torch.ones(7, device=self.device)  # [1, 1, gx, gy, gw, gh, 1]
+
         ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)
-        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)
+        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # (na, nt, 7): [img_idx, cls, x, y, w, h, anchor_idx]
         
         g = 0.5  # bias
         off = torch.tensor([
@@ -402,9 +401,13 @@ class YOLOLoss:
         
         for i in range(self.nl):
             anchors, shape = self.anchors[i], predictions[i].shape
-            gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]
-            
-            t = targets * gain
+            # shape should be (bs, na, ny, nx, no) which is 5 dimensions
+            # Extract grid dimensions: nx=shape[3], ny=shape[2]
+            if len(shape) != 5:
+                raise ValueError(f"Expected predictions[{i}] to have 5 dimensions (bs, na, ny, nx, no), got shape {shape}")
+            gain[2:6] = torch.tensor(shape, device=self.device)[[3, 2, 3, 2]]  # x, y, w, h gain
+
+            t = targets * gain  # Scale targets to grid size
             if nt:
                 # Match targets to anchors
                 r = t[..., 4:6] / anchors[:, None]

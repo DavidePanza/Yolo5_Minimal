@@ -127,15 +127,21 @@ def letterbox(img, new_shape=640, color=(114, 114, 114), auto=True, scaleFill=Fa
 def collate_fn(batch):
     """Custom collate function for batching."""
     imgs, labels = zip(*batch)
-    
-    # Add sample index to labels
+
+    # Add sample index to labels and reorder to [img_idx, class, x, y, w, h]
+    new_labels = []
     for i, l in enumerate(labels):
-        l[:, 0] = i  # add target image index for build_targets()
-        # Reorder to [img_idx, class, x, y, w, h]
         if len(l):
-            l = torch.cat([l[:, 0:1], l[:, 1:]], 1)
-    
-    return torch.stack(imgs, 0), torch.cat(labels, 0)
+            # Convert to float32 for MPS compatibility
+            l = l.float()
+            # Prepend image index to create [img_idx, class, x, y, w, h]
+            l = torch.cat([torch.full((len(l), 1), i, dtype=torch.float32), l], 1)
+            new_labels.append(l)
+
+    # Concatenate all labels (skip empty ones)
+    labels = torch.cat(new_labels, 0) if new_labels else torch.zeros((0, 6), dtype=torch.float32)
+
+    return torch.stack(imgs, 0), labels
 
 
 # ============================================================================
